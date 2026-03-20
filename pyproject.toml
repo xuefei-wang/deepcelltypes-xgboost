@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "deepcelltypes-xgboost"
+version = "0.1.0"
+description = "XGBoost baseline with Optuna tuning for cell type classification"
+requires-python = ">=3.11"
+dependencies = [
+    "deepcelltypes @ git+https://github.com/xuefei-wang/deepcelltypes-cell-type-assignment-pytorch.git",
+    "xgboost",
+    "click",
+    "numpy",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+tuning = ["optuna"]
+all = ["optuna", "wandb"]

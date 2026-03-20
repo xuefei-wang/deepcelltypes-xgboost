@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.env
+wandb_tmp/
+models/
+output/
+optuna_studies/
