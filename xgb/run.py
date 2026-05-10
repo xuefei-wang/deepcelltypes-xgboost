@@ -11,11 +11,12 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple
 import xgboost as xgb
+from sklearn.model_selection import GroupShuffleSplit
 
 # Default data directory from environment
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data2"))
 
-from deepcelltypes.config import TissueNetConfig, CELL_TYPE_HIERARCHY
+from deepcelltypes.config import TissueNetConfig
 from deepcelltypes.utils import (
     compute_baseline_metrics,
     save_baseline_predictions,
@@ -25,7 +26,6 @@ from deepcelltypes.utils import (
 
 @click.command()
 @click.option("--model_name", type=str, default="xgb_baseline_0")
-@click.option("--device_num", type=str, default="cuda:0", help="Unused, kept for consistency")
 @click.option("--enable_wandb", type=bool, default=False)
 @click.option(
     "--zarr_dir",
@@ -64,16 +64,13 @@ from deepcelltypes.utils import (
     default=0.1,
     help="Learning rate (eta)",
 )
-@click.option("--split_mode", type=click.Choice(["fov", "patch"]), default="fov",
-              help="Split strategy: 'fov' (default, no spatial leakage) or 'patch' (cell-level random)")
 @click.option("--split_file", type=str, default=None,
-              help="Path to pre-computed FOV split JSON (overrides split_mode/seed for splitting)")
+              help="Path to pre-computed FOV split JSON (required)")
 @click.option("--features_cache", type=str, default=None,
               help="Path to cache extracted features (.npz). Reuses cache if it exists.")
 @click.option("--min_channels", type=int, default=3, help="Min non-DAPI channels per dataset (filters 2-channel datasets)")
 def main(
     model_name: str,
-    device_num: str,
     enable_wandb: bool,
     zarr_dir: str,
     skip_datasets: Tuple[str, ...],
@@ -81,7 +78,6 @@ def main(
     n_estimators: int,
     max_depth: int,
     learning_rate: float,
-    split_mode: str,
     split_file: str,
     features_cache: str,
     min_channels: int,
@@ -101,7 +97,6 @@ def main(
                 "n_estimators": n_estimators,
                 "max_depth": max_depth,
                 "learning_rate": learning_rate,
-                "split_mode": split_mode,
             },
         )
 
@@ -132,6 +127,7 @@ def main(
     )
 
     X_train, y_train = data["X_train"], data["y_train"]
+    train_fov_names = data["train_fov_names"]
     X_test, y_test = data["X_val"], data["y_val"]
     test_dataset_names = data["val_dataset_names"]
     test_fov_names = data["val_fov_names"]
@@ -160,10 +156,24 @@ def main(
     y_test_compact = np.array([label_to_compact[y] for y in y_test])
     print(f"Unique cell types in data: {n_classes_compact} (of {num_classes} total)")
 
+    # Carve a FOV-grouped inner-validation set out of training data for early stopping.
+    # Test set MUST NOT be used as eval_set — that leaks test signal into tree-count selection.
+    train_fov_array = np.asarray(train_fov_names)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+    inner_train_idx, inner_val_idx = next(gss.split(X_train, y_train_compact, groups=train_fov_array))
+    X_inner_train = X_train[inner_train_idx]
+    y_inner_train = y_train_compact[inner_train_idx]
+    X_inner_val = X_train[inner_val_idx]
+    y_inner_val = y_train_compact[inner_val_idx]
+    print(f"Inner-val (FOV-grouped, disjoint from test): {len(inner_val_idx)} samples from "
+          f"{len(np.unique(train_fov_array[inner_val_idx]))} FOVs")
+
     # Train XGBoost model
     print("\nTraining XGBoost model...")
     early_stopping_rounds = max(10, n_estimators // 10)
     model = xgb.XGBClassifier(
+        objective="multi:softprob",
+        num_class=n_classes_compact,
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
@@ -174,30 +184,24 @@ def main(
         early_stopping_rounds=early_stopping_rounds,
     )
 
-    # Filter eval_set to labels seen in training (test-only classes would be out of range)
-    train_label_set = set(y_train_compact)
-    eval_mask = np.isin(y_test_compact, list(train_label_set))
-    if eval_mask.sum() < len(y_test_compact):
-        print(f"  Note: {len(y_test_compact) - eval_mask.sum()} eval samples have train-unseen labels, excluded from eval_set")
-
-    print(f"  Early stopping: {early_stopping_rounds} rounds")
+    print(f"  Early stopping: {early_stopping_rounds} rounds (inner-val FOV-grouped)")
     model.fit(
-        X_train,
-        y_train_compact,
-        eval_set=[(X_test[eval_mask], y_test_compact[eval_mask])],
+        X_inner_train,
+        y_inner_train,
+        eval_set=[(X_inner_val, y_inner_val)],
         verbose=True,
     )
-    print(f"  Best iteration: {model.best_iteration}, Best score: {model.best_score:.6f}")
+    print(f"  Best iteration: {model.best_iteration}, Best score (mlogloss): {model.best_score:.6f}")
 
     # Evaluate on test set
     print("\nEvaluating on test set...")
     y_pred_compact = model.predict(X_test)
     y_prob_compact = model.predict_proba(X_test)  # (N, n_model_classes)
 
-    # Metrics on compact labels (contiguous 0-indexed, required by confusion_matrix)
+    # Metrics on compact labels (contiguous 0-indexed, required by confusion_matrix).
+    # No hierarchy collapse — paper-faithful flat per-class accuracy.
     metrics = compute_baseline_metrics(
         y_test_compact, y_pred_compact, y_prob_compact, n_classes_compact,
-        hierarchy=CELL_TYPE_HIERARCHY, ct2idx=compact_ct2idx,
     )
 
     print(f"\nTest Results:")
