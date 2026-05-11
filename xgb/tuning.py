@@ -22,8 +22,8 @@ import xgboost as xgb
 # Default data directory from environment
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data2"))
 
-from deepcelltypes.config import TissueNetConfig, CELL_TYPE_HIERARCHY
-from deepcelltypes.utils import extract_features_from_zarr, compute_baseline_metrics
+from deepcell_types.training.config import TissueNetConfig, CELL_TYPE_HIERARCHY
+from deepcell_types.training.baseline_features import extract_features_from_zarr, compute_baseline_metrics
 
 
 class XGBoostObjective:
