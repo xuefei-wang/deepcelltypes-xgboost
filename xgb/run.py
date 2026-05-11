@@ -16,7 +16,7 @@ from sklearn.model_selection import GroupShuffleSplit
 # Default data directory from environment
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data2"))
 
-from deepcelltypes.config import TissueNetConfig
+from deepcelltypes.config import TissueNetConfig, CELL_TYPE_HIERARCHY
 from deepcelltypes.utils import (
     compute_baseline_metrics,
     save_baseline_predictions,
@@ -199,20 +199,26 @@ def main(
     y_prob_compact = model.predict_proba(X_test)  # (N, n_model_classes)
 
     # Metrics on compact labels (contiguous 0-indexed, required by confusion_matrix).
-    # No hierarchy collapse — paper-faithful flat per-class accuracy.
+    # Use shared hierarchy collapse (Tcell + Stromal) so XGBoost numbers are
+    # directly comparable to the main model's LossesAndMetrics.compute() output.
     metrics = compute_baseline_metrics(
         y_test_compact, y_pred_compact, y_prob_compact, n_classes_compact,
+        hierarchy=CELL_TYPE_HIERARCHY, ct2idx=compact_ct2idx,
     )
 
     print(f"\nTest Results:")
     print(f"  Macro Accuracy: {metrics['macro_accuracy']:.4f}")
     print(f"  Weighted Accuracy: {metrics['weighted_accuracy']:.4f}")
+    print(f"  Macro F1: {metrics['macro_f1']:.4f}")
+    print(f"  Weighted F1: {metrics['weighted_f1']:.4f}")
 
     # Log to wandb if enabled
     if enable_wandb:
         wandb.log({
             "test/macro_accuracy": metrics["macro_accuracy"],
             "test/weighted_accuracy": metrics["weighted_accuracy"],
+            "test/macro_f1": metrics["macro_f1"],
+            "test/weighted_f1": metrics["weighted_f1"],
         })
 
     # Save model
