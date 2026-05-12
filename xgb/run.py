@@ -30,7 +30,7 @@ from deepcell_types.training.baseline_features import (
 @click.option(
     "--zarr_dir",
     type=str,
-    default=str(DATA_DIR / "tissuenet-caitlin-labels.zarr"),
+    default=str(DATA_DIR),
 )
 @click.option(
     "--skip_datasets",
@@ -167,6 +167,41 @@ def main(
     y_inner_val = y_train_compact[inner_val_idx]
     print(f"Inner-val (FOV-grouped, disjoint from test): {len(inner_val_idx)} samples from "
           f"{len(np.unique(train_fov_array[inner_val_idx]))} FOVs")
+
+    # Re-tighten compact labels to be strictly contiguous 0..K-1 over the inner-train
+    # label set. Modern xgboost.sklearn.XGBClassifier rejects targets whose unique values
+    # don't equal [0..K-1] exactly. The initial compact mapping above is over
+    # union(train_unique, test_unique), but GroupShuffleSplit can leave compact labels
+    # with zero examples in y_inner_train, producing holes. We re-encode here and drop
+    # any inner-val / test rows with labels absent from inner_train (this only fires on
+    # tiny smoke-sized subsets — at full scale every train label is in inner_train).
+    train_present = np.unique(y_inner_train)
+    if len(train_present) != n_classes_compact or train_present[0] != 0 or \
+            train_present[-1] != len(train_present) - 1:
+        inner_remap = {int(orig): i for i, orig in enumerate(train_present)}
+        val_mask = np.isin(y_inner_val, train_present)
+        test_mask = np.isin(y_test_compact, train_present)
+        n_dropped_val = int((~val_mask).sum())
+        n_dropped_test = int((~test_mask).sum())
+        if n_dropped_val or n_dropped_test:
+            print(f"  Dropped {n_dropped_val} inner-val + {n_dropped_test} test rows "
+                  f"with labels absent from inner-train (smoke-scale artifact).")
+        X_inner_val = X_inner_val[val_mask]
+        y_inner_val = y_inner_val[val_mask]
+        X_test = X_test[test_mask]
+        y_test = y_test[test_mask]
+        y_test_compact = y_test_compact[test_mask]
+        test_dataset_names = [n for n, keep in zip(test_dataset_names, test_mask) if keep]
+        test_fov_names = [n for n, keep in zip(test_fov_names, test_mask) if keep]
+        test_cell_indices = [c for c, keep in zip(test_cell_indices, test_mask) if keep]
+        remap_fn = np.vectorize(inner_remap.get, otypes=[np.int64])
+        y_inner_train = remap_fn(y_inner_train)
+        y_inner_val = remap_fn(y_inner_val)
+        y_test_compact = remap_fn(y_test_compact)
+        compact_to_label = {i: compact_to_label[int(orig)] for i, orig in enumerate(train_present)}
+        compact_ct2idx = {name: inner_remap[orig] for name, orig in compact_ct2idx.items()
+                          if orig in inner_remap}
+        n_classes_compact = len(train_present)
 
     # Train XGBoost model
     print("\nTraining XGBoost model...")
