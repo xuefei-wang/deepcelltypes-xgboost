@@ -254,6 +254,54 @@ def train_best_model(
     X_inner_val = X_train[inner_val_idx]
     y_inner_val = y_train[inner_val_idx]
 
+    # GroupShuffleSplit does not guarantee every class is present in
+    # inner-train, and ``XGBClassifier`` rejects targets whose unique
+    # values don't equal [0..num_class-1] exactly. Re-tighten the label
+    # space to inner-train's class set and drop any inner-val / test
+    # rows whose label is absent (test rows dropped here are
+    # information loss, not leakage — they're rare classes the model
+    # couldn't predict anyway because they never appeared in
+    # inner-train). Mirrors the same logic in run.py:178-204. At full
+    # scale every class is in inner-train so this is a no-op.
+    train_present = np.unique(y_inner_train)
+    effective_num_classes = num_classes
+    X_test_eff = X_test
+    y_test_eff = y_test
+    test_drop_mask = None
+    if (
+        len(train_present) != num_classes
+        or train_present[0] != 0
+        or train_present[-1] != len(train_present) - 1
+    ):
+        inner_remap = {int(orig): i for i, orig in enumerate(train_present)}
+        val_mask = np.isin(y_inner_val, train_present)
+        test_mask = np.isin(y_test, train_present)
+        n_dropped_val = int((~val_mask).sum())
+        n_dropped_test = int((~test_mask).sum())
+        if n_dropped_val or n_dropped_test:
+            print(
+                f"  Dropped {n_dropped_val} inner-val + {n_dropped_test} test rows "
+                f"with labels absent from inner-train (small-split artifact)."
+            )
+        X_inner_val = X_inner_val[val_mask]
+        y_inner_val = y_inner_val[val_mask]
+        X_test_eff = X_test[test_mask]
+        y_test_eff = y_test[test_mask]
+        test_drop_mask = test_mask
+        remap_fn = np.vectorize(inner_remap.get, otypes=[np.int64])
+        y_inner_train = remap_fn(y_inner_train)
+        y_inner_val = remap_fn(y_inner_val)
+        y_test_eff = remap_fn(y_test_eff)
+        effective_num_classes = len(train_present)
+        # Update num_class on the params dict so XGBClassifier matches.
+        params["num_class"] = effective_num_classes
+        if ct2idx is not None:
+            ct2idx = {
+                name: inner_remap[orig]
+                for name, orig in ct2idx.items()
+                if orig in inner_remap
+            }
+
     early_stopping_rounds = max(10, params.get("n_estimators", 100) // 10)
     model = xgb.XGBClassifier(**params, early_stopping_rounds=early_stopping_rounds)
     model.fit(
@@ -264,10 +312,10 @@ def train_best_model(
     )
     print(f"  Best iteration: {model.best_iteration}, Best score: {model.best_score:.6f}")
 
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)
+    y_pred = model.predict(X_test_eff)
+    y_prob = model.predict_proba(X_test_eff)
     metrics = compute_baseline_metrics(
-        y_test, y_pred, y_prob, num_classes,
+        y_test_eff, y_pred, y_prob, effective_num_classes,
         hierarchy=hierarchy, ct2idx=ct2idx,
     )
 
