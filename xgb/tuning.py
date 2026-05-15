@@ -416,51 +416,104 @@ def main(
     y_train_all = y_train_full
     train_fov_names_all = train_fov_names_full
 
-    # Subsample training data for faster tuning trials
+    # Subsample training data for faster tuning trials. FOV names follow
+    # the same subsample so the FOV-grouped inner-val split below stays
+    # consistent.
     if max_tuning_samples and len(X_train_full) > max_tuning_samples:
         subsample_idx = np.random.RandomState(42).choice(
             len(X_train_full), max_tuning_samples, replace=False
         )
         X_train_full = X_train_full[subsample_idx]
         y_train_full = y_train_full[subsample_idx]
+        train_fov_names_subsampled = train_fov_names_full[subsample_idx]
         print(f"Subsampled training data to {max_tuning_samples} samples for tuning")
+    else:
+        train_fov_names_subsampled = train_fov_names_full
 
-    # Split training into train/val (75/25 of training = 60/20 of total)
-    # Use stratified split to ensure all classes appear in both partitions.
-    # StratifiedShuffleSplit requires >=2 samples per class. Duplicate singletons.
-    from sklearn.model_selection import StratifiedShuffleSplit
-    unique, counts = np.unique(y_train_full, return_counts=True)
-    singletons = unique[counts == 1]
-    if len(singletons) > 0:
-        singleton_mask = np.isin(y_train_full, singletons)
-        singleton_idx = np.where(singleton_mask)[0]
-        X_train_full = np.concatenate([X_train_full, X_train_full[singleton_idx]])
-        y_train_full = np.concatenate([y_train_full, y_train_full[singleton_idx]])
-        print(f"Duplicated {len(singletons)} singleton classes for stratified split")
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
-    train_idx, val_idx = next(sss.split(X_train_full, y_train_full))
+    # Inner train/val split for the Optuna objective. FOV-grouped so that
+    # cells from the same FOV cannot appear in both partitions —
+    # otherwise hyperparameters that benefit from within-FOV memorisation
+    # (e.g. deeper trees) win the tuning, but the FOV-disjoint test set
+    # the paper reports is unkind to those choices. Mirrors the split
+    # used in ``run.py`` and ``train_best_model``. Test size 0.25 (== 75/25 of
+    # subsampled training data) is kept from the previous stratified
+    # version for run-to-run continuity.
+    from sklearn.model_selection import GroupShuffleSplit
+    gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
+    train_idx, val_idx = next(
+        gss_inner.split(
+            X_train_full, y_train_full, groups=train_fov_names_subsampled
+        )
+    )
 
     X_train = X_train_full[train_idx]
     y_train = y_train_full[train_idx]
     X_val = X_train_full[val_idx]
     y_val = y_train_full[val_idx]
+    n_inner_val_fovs = len(np.unique(train_fov_names_subsampled[val_idx]))
+
+    # GroupShuffleSplit doesn't guarantee every class is in inner-train
+    # (StratifiedShuffleSplit + singleton duplication previously
+    # enforced this at the cost of a tiny inner train/val leak).
+    # Re-tighten labels to [0..K-1] over inner-train's class set so
+    # XGBClassifier accepts the targets; drop inner-val / test rows
+    # whose label is absent from inner-train. This mirrors run.py:178-204.
+    # ``X_test`` and the original ``n_classes_compact`` are restored before
+    # the final ``train_best_model`` call below, which is fitted on the
+    # full un-subsampled training data and sees all classes.
+    train_present = np.unique(y_train)
+    tuning_n_classes = int(n_classes_compact)
+    tuning_ct2idx = dict(compact_ct2idx)
+    X_val_tuning = X_val
+    y_val_tuning = y_val
+    if (
+        len(train_present) != n_classes_compact
+        or train_present[0] != 0
+        or train_present[-1] != len(train_present) - 1
+    ):
+        inner_remap = {int(orig): i for i, orig in enumerate(train_present)}
+        val_mask = np.isin(y_val, train_present)
+        n_dropped_val = int((~val_mask).sum())
+        if n_dropped_val:
+            print(
+                f"  Dropped {n_dropped_val} inner-val rows whose label is "
+                f"absent from FOV-grouped inner-train."
+            )
+        X_val_tuning = X_val[val_mask]
+        y_val_tuning = y_val[val_mask]
+        remap_fn = np.vectorize(inner_remap.get, otypes=[np.int64])
+        y_train = remap_fn(y_train)
+        y_val_tuning = remap_fn(y_val_tuning)
+        tuning_ct2idx = {
+            name: inner_remap[orig]
+            for name, orig in compact_ct2idx.items()
+            if orig in inner_remap
+        }
+        tuning_n_classes = len(train_present)
 
     print(f"\nData splits:")
-    print(f"  Training: {len(X_train)} samples")
-    print(f"  Validation: {len(X_val)} samples")
-    print(f"  Test: {len(X_test)} samples")
+    print(
+        f"  Inner-train (FOV-grouped): {len(X_train)} samples, "
+        f"{len(np.unique(train_fov_names_subsampled[train_idx]))} FOVs, "
+        f"{tuning_n_classes} classes"
+    )
+    print(
+        f"  Inner-val (FOV-grouped):   {len(X_val_tuning)} samples, "
+        f"{n_inner_val_fovs} FOVs"
+    )
+    print(f"  Test:                      {len(X_test)} samples (held out, not used in tuning)")
 
     # Run hyperparameter tuning
     print(f"\nStarting hyperparameter tuning ({n_trials} trials)...")
     study, best_params = run_tuning(
-        X_train, y_train, X_val, y_val,
-        num_classes=n_classes_compact,
+        X_train, y_train, X_val_tuning, y_val_tuning,
+        num_classes=tuning_n_classes,
         n_trials=n_trials,
         metric=metric,
         study_name=study_name,
         storage=storage,
         hierarchy=CELL_TYPE_HIERARCHY,
-        ct2idx=compact_ct2idx,
+        ct2idx=tuning_ct2idx,
         device=device_num,
     )
 
