@@ -176,20 +176,31 @@ def train_best_model(
     device: str = "cpu",
     hierarchy: dict = None,
     ct2idx: dict = None,
+    train_fov_names: Optional[np.ndarray] = None,
 ) -> Tuple[xgb.XGBClassifier, dict]:
     """
     Train final model with best parameters.
 
+    Early stopping uses a FOV-grouped inner-validation set carved out of the
+    training data (or, if FOV names are not provided, a stratified inner-val).
+    The held-out (X_test, y_test) is reserved for the reported metric only —
+    it must NOT be passed as ``eval_set``, since that would let
+    ``early_stopping_rounds`` select ``best_iteration`` to minimise loss on
+    the same data we report metrics on (leakage into ``test_metrics``).
+
     Args:
         X_train: Training features
         y_train: Training labels
-        X_test: Test features
-        y_test: Test labels
+        X_test: Test features (reported metric only — never used for early stop)
+        y_test: Test labels (reported metric only — never used for early stop)
         best_params: Best hyperparameters from tuning
         num_classes: Number of classes
         device: Device for training (cpu or cuda:N)
         hierarchy: Cell type hierarchy for hierarchical eval
         ct2idx: Cell type to index mapping
+        train_fov_names: Per-row FOV identifier for X_train; when provided,
+            the inner-validation split is FOV-grouped (preferred, mirrors
+            run.py). If None, falls back to stratified inner-val.
 
     Returns:
         model: Trained XGBoost model
@@ -206,12 +217,49 @@ def train_best_model(
         "verbosity": 1,
     }
 
+    # Carve an inner-validation set for early stopping. Disjoint from X_test
+    # by construction (X_test is never passed in).
+    if train_fov_names is not None:
+        from sklearn.model_selection import GroupShuffleSplit
+        train_fov_array = np.asarray(train_fov_names)
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+        inner_train_idx, inner_val_idx = next(
+            gss.split(X_train, y_train, groups=train_fov_array)
+        )
+        n_inner_val_fovs = len(np.unique(train_fov_array[inner_val_idx]))
+        print(
+            f"  Inner-val for early stopping (FOV-grouped): "
+            f"{len(inner_val_idx)} samples from {n_inner_val_fovs} FOVs"
+        )
+    else:
+        from sklearn.model_selection import StratifiedShuffleSplit
+        # Stratification falls back to a plain shuffle if any class has <2
+        # rows, since StratifiedShuffleSplit requires at least one row per
+        # class in each partition.
+        unique, counts = np.unique(y_train, return_counts=True)
+        if (counts >= 2).all():
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+            inner_train_idx, inner_val_idx = next(sss.split(X_train, y_train))
+        else:
+            from sklearn.model_selection import ShuffleSplit
+            ss = ShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+            inner_train_idx, inner_val_idx = next(ss.split(X_train))
+        print(
+            f"  Inner-val for early stopping (stratified, no FOV names): "
+            f"{len(inner_val_idx)} samples"
+        )
+
+    X_inner_train = X_train[inner_train_idx]
+    y_inner_train = y_train[inner_train_idx]
+    X_inner_val = X_train[inner_val_idx]
+    y_inner_val = y_train[inner_val_idx]
+
     early_stopping_rounds = max(10, params.get("n_estimators", 100) // 10)
     model = xgb.XGBClassifier(**params, early_stopping_rounds=early_stopping_rounds)
     model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_test, y_test)],
+        X_inner_train,
+        y_inner_train,
+        eval_set=[(X_inner_val, y_inner_val)],
         verbose=True,
     )
     print(f"  Best iteration: {model.best_iteration}, Best score: {model.best_score:.6f}")
@@ -330,6 +378,7 @@ def main(
 
     X_train_full, y_train_full = data["X_train"], data["y_train"]
     X_test, y_test = data["X_val"], data["y_val"]
+    train_fov_names_full = np.asarray(data["train_fov_names"])
 
     print(f"Training set: {X_train_full.shape[0]} samples, {X_train_full.shape[1]} features")
     print(f"Test set: {X_test.shape[0]} samples, {X_test.shape[1]} features")
@@ -355,9 +404,12 @@ def main(
     y_test = np.array([label_to_compact[y] for y in y_test])
     print(f"Unique cell types in data: {n_classes_compact} (of {num_classes} total)")
 
-    # Save full training data for final model (before subsampling)
+    # Save full training data for final model (before subsampling).
+    # FOV names travel alongside so the final fit can carve a FOV-grouped
+    # inner-val for early stopping (see ``train_best_model``).
     X_train_all = X_train_full
     y_train_all = y_train_full
+    train_fov_names_all = train_fov_names_full
 
     # Subsample training data for faster tuning trials
     if max_tuning_samples and len(X_train_full) > max_tuning_samples:
@@ -423,6 +475,7 @@ def main(
         device=device_num,
         hierarchy=CELL_TYPE_HIERARCHY,
         ct2idx=compact_ct2idx,
+        train_fov_names=train_fov_names_all,
     )
 
     print(f"\nFinal Test Results:")
