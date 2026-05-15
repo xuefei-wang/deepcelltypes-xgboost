@@ -365,7 +365,11 @@ def main(
     if split_file is None:
         raise click.UsageError("--split_file is required. Generate one with: python -m scripts.generate_splits")
 
-    # Extract features directly from zarr (fast path, ~20-50x faster than DataLoader)
+    # Extract features directly from zarr (fast path, ~20-50x faster than DataLoader).
+    # ``missing_value=np.nan`` so absent markers route through XGBoost's
+    # ``missing=NaN`` default-direction logic at every split — without it
+    # absent markers would be conflated with real channels whose mean
+    # intensity happens to be 0.0.
     print("\nExtracting features from zarr...")
     data = extract_features_from_zarr(
         zarr_dir=zarr_dir,
@@ -374,6 +378,7 @@ def main(
         skip_datasets=skip_datasets,
         keep_datasets=keep_datasets,
         min_channels=min_channels,
+        missing_value=np.nan,
     )
 
     X_train_full, y_train_full = data["X_train"], data["y_train"]
